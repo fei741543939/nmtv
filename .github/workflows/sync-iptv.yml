@@ -1,0 +1,125 @@
+name: Auto Sync IPTV with Email
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+
+jobs:
+  sync-and-notify:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout your repo
+      uses: actions/checkout@v5
+      with:
+        token: ${{ secrets.PAT_TOKEN }}
+    
+    - name: Check current file hash
+      id: hash_check
+      run: |
+        if [ -f "iptv-fe.m3u" ]; then
+          OLD_HASH=$(sha256sum iptv-fe.m3u | awk '{print $1}')
+          echo "old_hash=$OLD_HASH" >> $GITHUB_OUTPUT
+        else
+          echo "old_hash=none" >> $GITHUB_OUTPUT
+        fi
+    
+    # 下载 → 修正 cctv 文件格式 → 合并
+    - name: Download, fix and merge source files
+      id: download
+      run: |
+        # 下载两个源文件
+        curl -s -L -o migu.m3u "https://raw.githubusercontent.com/ioptu/migu_video/main/migu.m3u"
+        curl -s -L -o cctv_raw.m3u "https://raw.githubusercontent.com/ioptu/migu_video/main/cctv.migu.m3u"
+        
+        # 修正 cctv 文件：在每个 #EXTINF 行的 tvg-logo="..." 后面插入 ,group-title="央视专版",
+        # 原始格式：#EXTINF:-1 tvg-id="CCTV1" tvg-name="CCTV1" tvg-logo="..."CCTV1
+        # 目标格式：#EXTINF:-1 tvg-id="CCTV1" tvg-name="CCTV1" tvg-logo="...",group-title="央视专版",CCTV1
+        sed -i 's/\(tvg-logo="[^"]*"\)/\1,group-title="央视专版",/' cctv_raw.m3u
+        
+        # 合并两个文件（去除重复的 #EXTM3U 头部）
+        # 先写入 migu.m3u（保留其头部）
+        head -1 migu.m3u | grep -q "^#EXTM3U" && has_header1=true || has_header1=false
+        if [ "$has_header1" = true ]; then
+          cat migu.m3u > new-iptv.m3u
+        else
+          echo "#EXTM3U" > new-iptv.m3u
+          cat migu.m3u >> new-iptv.m3u
+        fi
+        
+        # 追加修正后的 cctv 内容（去掉可能的 #EXTM3U 行）
+        head -1 cctv_raw.m3u | grep -q "^#EXTM3U" && has_header2=true || has_header2=false
+        if [ "$has_header2" = true ]; then
+          tail -n +2 cctv_raw.m3u >> new-iptv.m3u
+        else
+          cat cctv_raw.m3u >> new-iptv.m3u
+        fi
+        
+        # 计算哈希和统计信息
+        NEW_HASH=$(sha256sum new-iptv.m3u | awk '{print $1}')
+        echo "new_hash=$NEW_HASH" >> $GITHUB_OUTPUT
+        FILESIZE=$(stat -f%z new-iptv.m3u 2>/dev/null || stat -c%s new-iptv.m3u)
+        LINES=$(wc -l < new-iptv.m3u)
+        echo "合并后文件大小: ${FILESIZE}字节, ${LINES}行"
+        
+        # 源文件行数（供邮件使用）
+        LINES1=$(wc -l < migu.m3u)
+        LINES2=$(wc -l < cctv_raw.m3u)
+        echo "source1_lines=$LINES1" >> $GITHUB_OUTPUT
+        echo "source2_lines=$LINES2" >> $GITHUB_OUTPUT
+    
+    - name: Compare files
+      id: compare
+      run: |
+        if [ "${{ steps.hash_check.outputs.old_hash }}" == "${{ steps.download.outputs.new_hash }}" ]; then
+          echo "changed=false" >> $GITHUB_OUTPUT
+        else
+          echo "changed=true" >> $GITHUB_OUTPUT
+        fi
+    
+    - name: Update and push
+      if: steps.compare.outputs.changed == 'true'
+      run: |
+        mv new-iptv.m3u iptv-fe.m3u
+        git config --global user.name "GitHub Actions Bot"
+        git config --global user.email "actions@github.com"
+        git add iptv-fe.m3u
+        git commit -m "🔄 自动同步IPTV: $(date -u '+%Y-%m-%d %H:%M:%S UTC')
+        
+        源文件1: migu.m3u (无修改)
+        源文件2: cctv.migu.m3u (已自动添加 group-title=\"央视专版\")
+        合并后哈希: ${{ steps.download.outputs.new_hash }}"
+        git push origin main
+    
+    - name: Send email notification
+      if: steps.compare.outputs.changed == 'true'
+      uses: dawidd6/action-send-mail@v16
+      with:
+        server_address: smtp.gmail.com
+        server_port: 465
+        username: ${{ secrets.EMAIL_USER }}
+        password: ${{ secrets.EMAIL_PASSWORD }}
+        subject: "✅ IPTV文件已自动更新 - $(date -u '+%Y-%m-%d %H:%M') UTC"
+        to: ${{ secrets.NOTIFY_EMAIL }}
+        from: GitHub Actions <actions@github.com>
+        html_body: |
+          <h2>📡 IPTV文件自动同步完成</h2>
+          <div style="background-color: #f0f8ff; padding: 15px; border-radius: 5px;">
+            <p><strong>🔄 同步状态：</strong> <span style="color: green;">✅ 成功更新</span></p>
+            <p><strong>📅 更新时间：</strong> $(date -u '+%Y-%m-%d %H:%M:%S UTC')</p>
+            <p><strong>🔗 源文件1（migu.m3u）：</strong> <a href="https://github.com/ioptu/migu_video/blob/main/migu.m3u">ioptu/migu_video/migu.m3u</a> (共 ${{ steps.download.outputs.source1_lines }} 行)</p>
+            <p><strong>🔗 源文件2（cctv.migu.m3u）：</strong> <a href="https://github.com/ioptu/migu_video/blob/main/cctv.migu.m3u">ioptu/migu_video/cctv.migu.m3u</a> (共 ${{ steps.download.outputs.source2_lines }} 行，已自动添加 group-title="央视专版")</p>
+            <p><strong>📂 你的文件：</strong> <a href="https://github.com/jia070310/lemonTV/blob/main/iptv-fe.m3u">jia070310/lemonTV/iptv-fe.m3u</a></p>
+          </div>
+          <div style="background-color: #f9f9f9; padding: 15px; margin-top: 15px;">
+            <h3>📊 文件信息</h3>
+            <p><strong>新哈希：</strong> <code>${{ steps.download.outputs.new_hash }}</code></p>
+            <p><strong>旧哈希：</strong> <code>${{ steps.hash_check.outputs.old_hash }}</code></p>
+          </div>
+          <p><small>此邮件由 GitHub Actions 自动发送</small></p>
+    
+    - name: Log no changes
+      if: steps.compare.outputs.changed == 'false'
+      run: |
+        echo "⏭️ $(date -u '+%Y-%m-%d %H:%M:%S UTC') - 文件未变化，跳过更新"
